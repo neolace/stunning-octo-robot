@@ -1,32 +1,48 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net.Http.Headers;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Graph;
 using Microsoft.Identity.Client;
-using System.Net.Http.Headers;
 
 namespace PersonalAIAgent
 {
     public class GraphService
     {
         private readonly GraphServiceClient _client;
+        private readonly string _senderEmail;
 
-        public GraphService(IConfiguration config)
+        public GraphService(IConfiguration configuration)
         {
-            var clientId = config["AzureAd:ClientId"];
-            var tenantId = config["AzureAd:TenantId"];
-            var clientSecret = config["AzureAd:ClientSecret"];
+            if (configuration == null) throw new ArgumentNullException(nameof(configuration));
 
-            var confidentialClient = ConfidentialClientApplicationBuilder
+            var clientId = configuration["AzureAd:ClientId"];
+            var tenantId = configuration["AzureAd:TenantId"];
+            var clientSecret = configuration["AzureAd:ClientSecret"];
+            _senderEmail = configuration["AzureAd:SenderEmail"] ?? configuration["Graph:SenderEmail"];
+
+            if (string.IsNullOrWhiteSpace(clientId))
+                throw new InvalidOperationException("AzureAd:ClientId is not configured.");
+            if (string.IsNullOrWhiteSpace(tenantId))
+                throw new InvalidOperationException("AzureAd:TenantId is not configured.");
+            if (string.IsNullOrWhiteSpace(clientSecret))
+                throw new InvalidOperationException("AzureAd:ClientSecret is not configured.");
+            if (string.IsNullOrWhiteSpace(_senderEmail))
+                throw new InvalidOperationException("Sender email is required for app-only (client credentials) flow. Set AzureAd:SenderEmail to the mailbox to use for sending/uploading.");
+
+            var app = ConfidentialClientApplicationBuilder
                 .Create(clientId)
                 .WithTenantId(tenantId)
                 .WithClientSecret(clientSecret)
                 .Build();
 
-            var authProvider = new DelegateAuthenticationProvider(async request =>
+            var authProvider = new DelegateAuthenticationProvider(async (requestMessage) =>
             {
-                var result = await confidentialClient
-                    .AcquireTokenForClient(new[] { "https://graph.microsoft.com/.default" })
-                    .ExecuteAsync();
-                request.Headers.Authorization =
-                    new AuthenticationHeaderValue("Bearer", result.AccessToken);
+                var scopes = new[] { "https://graph.microsoft.com/.default" };
+                var result = await app.AcquireTokenForClient(scopes).ExecuteAsync().ConfigureAwait(false);
+                requestMessage.Headers.Authorization = new AuthenticationHeaderValue("Bearer", result.AccessToken);
             });
 
             _client = new GraphServiceClient(authProvider);
@@ -34,18 +50,51 @@ namespace PersonalAIAgent
 
         public async Task SendEmailAsync(string to, string subject, string body)
         {
+            if (string.IsNullOrWhiteSpace(to)) throw new ArgumentNullException(nameof(to));
+            if (subject == null) subject = string.Empty;
+            if (body == null) body = string.Empty;
+
             var message = new Message
             {
                 Subject = subject,
-                Body = new ItemBody { ContentType = BodyType.Html, Content = body },
-                ToRecipients = new[] { new Recipient { EmailAddress = new EmailAddress { Address = to } } }
+                Body = new ItemBody
+                {
+                    ContentType = BodyType.Text,
+                    Content = body
+                },
+                ToRecipients = new List<Recipient>
+                {
+                    new Recipient
+                    {
+                        EmailAddress = new EmailAddress { Address = to }
+                    }
+                }
             };
-            await _client.Me.SendMail(message, true).Request().PostAsync();
+
+            // Use the specified user mailbox when operating in app-only mode.
+            await _client.Users[_senderEmail]
+                .SendMail(message, saveToSentItems: true)
+                .Request()
+                .PostAsync()
+                .ConfigureAwait(false);
         }
 
-        public async Task UploadFileAsync(string path, Stream content)
+        public async Task<DriveItem> UploadFileAsync(Stream fileStream, string fileName)
         {
-            await _client.Me.Drive.Root.ItemWithPath(path).Content.Request().PutAsync<DriveItem>(content);
+            if (fileStream == null) throw new ArgumentNullException(nameof(fileStream));
+            if (string.IsNullOrWhiteSpace(fileName)) throw new ArgumentNullException(nameof(fileName));
+
+            // Upload to the specified user's OneDrive root using app-only permissions.
+            var uploaded = await _client.Users[_senderEmail]
+                .Drive
+                .Root
+                .ItemWithPath(fileName)
+                .Content
+                .Request()
+                .PutAsync<DriveItem>(fileStream)
+                .ConfigureAwait(false);
+
+            return uploaded;
         }
     }
 }
